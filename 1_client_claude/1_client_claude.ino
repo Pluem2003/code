@@ -10,8 +10,8 @@
 #define DATA_INTERVAL 500    
 #define SEND_INTERVAL 200   
 #define NUM_READINGS 20     
-#define CHUNK_SIZE 5       
-#define MAX_RETRIES 3      
+#define CHUNK_SIZE 1       
+#define MAX_RETRIES 10      
 
 // Variables
 float readings[NUM_READINGS];

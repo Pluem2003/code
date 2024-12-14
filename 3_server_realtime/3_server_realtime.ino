@@ -8,7 +8,7 @@ const char* WIFI_PASSWORD = "76543210";
 const char* MQTT_SERVER = "49.228.131.61";
 const char* MQTT_CLIENT_ID = "ESP32_Gateway";
 #define MQTT_PORT 4663
-#define MQTT_TOPIC "sensor/data"
+#define MQTT_TOPIC "sensor/realtime"
 #define MQTT_STATUS_TOPIC "sensor/status"
 #define timescan 10
 
@@ -18,19 +18,16 @@ static const BLEUUID SERVICE_UUID_2("12345678-1234-1234-1234-123456789ab2");
 static const BLEUUID CHAR_UUID("abcdabcd-1234-5678-abcd-123456789abc");
 static const BLEUUID SERVICE_UUIDS[] = {SERVICE_UUID_1, SERVICE_UUID_2};
 
-// Updated SensorData structure to handle chunked data
-struct SensorData {
+// Updated RealTimeSensorData structure to handle streaming
+struct RealTimeSensorData {
     int measurementCycle;
-    int currentChunk;
-    int totalChunks;
-    float readings[20];  // รองรับข้อมูล 20 ค่า
-    String chunks[20];  // เพิ่มขนาดเป็น 20 เพื่อรองรับ chunk ทั้งหมด
-    bool chunkReceived[20]; // ขนาดเป็น 20 เพื่อรองรับ chunk ได้มากขึ้น
-    bool dataComplete;
+    unsigned long timestamp;
+    float reading;
+    String deviceName;
 };
 
 // Global variables
-static SensorData sensorDataBuffer[2];
+static RealTimeSensorData sensorDataBuffer[2];
 static unsigned long lastWiFiRetry = 0;
 static unsigned long lastMQTTRetry = 0;
 static unsigned long lastScan = 0;
@@ -79,113 +76,56 @@ void sendStatusUpdate() {
     mqttClient.publish(MQTT_STATUS_TOPIC, status.c_str());
 }
 
-void processCompleteData(uint8_t clientIdx) {
+void publishRealTimeData(uint8_t clientIdx) {
     String jsonData = "{";
     jsonData += "\"device_id\":" + String(clientIdx + 1) + ",";
-    jsonData += "\"device_name\":\"" + deviceNames[clientIdx] + "\",";
+    jsonData += "\"device_name\":\"" + sensorDataBuffer[clientIdx].deviceName + "\",";
     jsonData += "\"measurement_cycle\":" + String(sensorDataBuffer[clientIdx].measurementCycle) + ",";
-    jsonData += "\"readings\":[";
-    
-    for (int i = 0; i < 20; i++) {
-        if (i > 0) jsonData += ",";
-        jsonData += String(sensorDataBuffer[clientIdx].readings[i], 3);
-    }
-    
-    jsonData += "]}";
+    jsonData += "\"timestamp\":" + String(sensorDataBuffer[clientIdx].timestamp) + ",";
+    jsonData += "\"reading\":" + String(sensorDataBuffer[clientIdx].reading, 3);
+    jsonData += "}";
     
     String topic = String(MQTT_TOPIC) + "/" + String(clientIdx + 1);
     if (mqttClient.connected()) {
         mqttClient.publish(topic.c_str(), jsonData.c_str());
         Serial.println("Published to MQTT: " + jsonData);
+        lastDataReceived[clientIdx] = millis();
     } else {
         Serial.println("MQTT not connected, cannot publish");
     }
-    
-    // Reset buffer
-    memset(&sensorDataBuffer[clientIdx], 0, sizeof(SensorData));
-    lastDataReceived[clientIdx] = millis();
 }
 
 void processIncomingData(uint8_t clientIdx, String value) {
-    Serial.println("\n-------- Incoming Data --------");
+    Serial.println("\n-------- Incoming Real-Time Data --------");
     Serial.printf("Device %d Raw Data: %s\n", clientIdx + 1, value.c_str());
 
     // Split the incoming data
     int firstComma = value.indexOf(',');
     int secondComma = value.indexOf(',', firstComma + 1);
-    int thirdComma = value.indexOf(',', secondComma + 1);
     
-    if (firstComma == -1 || secondComma == -1 || thirdComma == -1) {
+    if (firstComma == -1 || secondComma == -1) {
         Serial.println("Invalid data format");
         return;
     }
     
-    // Parse header information
+    // Parse data
     int measurementCycle = value.substring(0, firstComma).toInt();
-    int currentChunk = value.substring(firstComma + 1, secondComma).toInt();
-    int totalChunks = value.substring(secondComma + 1, thirdComma).toInt();
-    String readings = value.substring(thirdComma + 1);
+    unsigned long timestamp = value.substring(firstComma + 1, secondComma).toInt();
+    float reading = value.substring(secondComma + 1).toFloat();
     
-    Serial.println("\n-------- Parsed Data --------");
+    // Store in buffer
+    sensorDataBuffer[clientIdx].measurementCycle = measurementCycle;
+    sensorDataBuffer[clientIdx].timestamp = timestamp;
+    sensorDataBuffer[clientIdx].reading = reading;
+    sensorDataBuffer[clientIdx].deviceName = deviceNames[clientIdx];
+    
+    // Publish data
+    publishRealTimeData(clientIdx);
+    
+    Serial.println("\n-------- Parsed Real-Time Data --------");
     Serial.printf("Measurement Cycle: %d\n", measurementCycle);
-    Serial.printf("Current Chunk: %d\n", currentChunk);
-    Serial.printf("Total Chunks: %d\n", totalChunks);
-    Serial.printf("Readings: %s\n", readings.c_str());
-
-    // ตรวจสอบ measurement cycle ใหม่
-    if (measurementCycle != sensorDataBuffer[clientIdx].measurementCycle) {
-        // Reset buffer เมื่อเริ่ม cycle ใหม่
-        memset(&sensorDataBuffer[clientIdx], 0, sizeof(SensorData));
-        sensorDataBuffer[clientIdx].measurementCycle = measurementCycle;
-        sensorDataBuffer[clientIdx].totalChunks = totalChunks;
-        Serial.printf("Starting new measurement cycle: %d\n", measurementCycle);
-    }
-    
-    // เก็บ chunk
-    if (currentChunk < totalChunks && !sensorDataBuffer[clientIdx].chunkReceived[currentChunk]) {
-        sensorDataBuffer[clientIdx].chunks[currentChunk] = readings;
-        sensorDataBuffer[clientIdx].chunkReceived[currentChunk] = true;
-        
-        Serial.printf("Stored chunk %d/%d from sensor %d\n", 
-                     currentChunk + 1, totalChunks, clientIdx + 1);
-        
-        // ตรวจสอบว่าได้รับ chunks ครบหรือยัง
-        bool allChunksReceived = true;
-        for (int i = 0; i < totalChunks; i++) {
-            if (!sensorDataBuffer[clientIdx].chunkReceived[i]) {
-                allChunksReceived = false;
-                break;
-            }
-        }
-        
-        if (allChunksReceived) {
-            Serial.println("\n-------- Processing Complete Dataset --------");
-            // ประมวลผลทุก chunks
-            int readingIndex = 0;
-            for (int i = 0; i < totalChunks && readingIndex < 20; i++) {
-                String chunk = sensorDataBuffer[clientIdx].chunks[i];
-                Serial.printf("Processing chunk %d: %s\n", i + 1, chunk.c_str());
-                
-                int startPos = 0;
-                while (startPos < chunk.length() && readingIndex < 20) {
-                    int commaPos = chunk.indexOf(',', startPos);
-                    if (commaPos == -1) commaPos = chunk.length();
-                    
-                    String readingStr = chunk.substring(startPos, commaPos);
-                    float reading = readingStr.toFloat();
-                    sensorDataBuffer[clientIdx].readings[readingIndex] = reading;
-                    
-                    Serial.printf("Reading %d: %.3f\n", readingIndex + 1, reading);
-                    
-                    readingIndex++;
-                    startPos = commaPos + 1;
-                }
-            }
-            
-            // Process complete dataset
-            processCompleteData(clientIdx);
-        }
-    }
+    Serial.printf("Timestamp: %lu\n", timestamp);
+    Serial.printf("Reading: %.3f\n", reading);
     Serial.println("----------------------------------------\n");
 }
 
@@ -273,7 +213,7 @@ void setup() {
     
     // Initialize sensor data buffers
     for (int i = 0; i < 2; i++) {
-        memset(&sensorDataBuffer[i], 0, sizeof(SensorData));
+        memset(&sensorDataBuffer[i], 0, sizeof(RealTimeSensorData));
     }
 }
 
